@@ -1,89 +1,155 @@
 #!/usr/bin/env python3
-import argparse, csv, hashlib, json, random
-from collections import Counter, defaultdict
+"""Build leakage-checked audio manifests before any model is loaded."""
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+import csv
+import json
 from pathlib import Path
-import torchaudio
+import random
+import unicodedata
+
+try:
+    from . import _common as io
+except ImportError:
+    import _common as io
 
 
-def sha256(path: Path, chunk=1024*1024):
-    h=hashlib.sha256()
-    with path.open('rb') as f:
-        while True:
-            b=f.read(chunk)
-            if not b: break
-            h.update(b)
-    return h.hexdigest()
+def normalize_group(text):
+    # Deliberately conservative; accents remain significant.
+    return " ".join("".join(c if c.isalnum() else " " for c in
+                            unicodedata.normalize("NFKC", text).casefold()).split())
 
 
-def load_rows(path: Path):
-    if path.suffix.lower()=='.jsonl':
-        return [json.loads(x) for x in path.read_text(encoding='utf-8').splitlines() if x.strip()]
-    with path.open(newline='', encoding='utf-8-sig') as f:
-        return list(csv.DictReader(f))
+def split_rows(rows, seed, train_frac, dev_frac, allow_self=False):
+    fractions = {"train": train_frac, "dev": dev_frac, "test": max(0., 1 - train_frac - dev_frac)}
+    if not 0 < train_frac <= 1 or not 0 <= dev_frac < 1 or train_frac + dev_frac > 1 + 1e-12:
+        raise ValueError("invalid split fractions")
+    # Union connected sessions, duplicate audio/text, template groups and explicit refs.
+    parent = list(range(len(rows)))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def join(a, b):
+        parent[root(b)] = root(a)
+
+    seen, audio_owner = {}, {}
+    missing_session_speakers = {r["speaker"] for r in rows if not r.get("session")}
+    for i, row in enumerate(rows):
+        session = "__all__" if row["speaker"] in missing_session_speakers else row["session"]
+        keys = [("session", row["speaker"], session), ("audio", row["audio_sha256"]),
+                ("text", normalize_group(row["text"]))]
+        if row.get("text_group"):
+            keys.append(("template", row["text_group"]))
+        for key in keys:
+            if key in seen:
+                join(i, seen[key])
+            else:
+                seen[key] = i
+        audio_owner.setdefault(row["audio_sha256"], []).append(i)
+    for i, row in enumerate(rows):
+        if row.get("ref_audio"):
+            owners = audio_owner.get(row["ref_audio_sha256"], [])
+            if not owners or any(rows[j]["speaker"] != row["speaker"] for j in owners):
+                raise ValueError("explicit reference must be a manifest row from the same speaker")
+            for j in owners:
+                join(i, j)
+    groups = defaultdict(list)
+    for i, row in enumerate(rows):
+        groups[root(i)].append(dict(row))
+    groups = list(groups.values())
+    active = [k for k, v in fractions.items() if v > 1e-12]
+    if len(groups) < len(active):
+        raise ValueError("too few independent groups for nonempty splits; add sessions or explicitly disable holdouts")
+    random.Random(seed).shuffle(groups)
+    splits = {k: [] for k in fractions}
+    hours = dict.fromkeys(fractions, 0.)
+    total = sum(r["duration_s"] for r in rows)
+    for i, group in enumerate(groups):
+        empty = [k for k in active if not splits[k]]
+        candidates = empty if len(groups) - i == len(empty) else active
+        name = max(candidates, key=lambda k: fractions[k] * total - hours[k])
+        splits[name].extend(group)
+        hours[name] += sum(r["duration_s"] for r in group)
+    for name, items in splits.items():
+        for row in items:
+            row["split"] = name
+            if not row.get("ref_audio"):
+                choices = sorted((r for r in items if r["speaker"] == row["speaker"]
+                                  and r["audio_sha256"] != row["audio_sha256"]), key=lambda r: r["row_id"])
+                if not choices and not (allow_self and name == "train"):
+                    raise ValueError(f"{row['row_id']}: no distinct same-speaker reference within {name}")
+                ref = choices[0] if choices else row
+                row["ref_audio"], row["ref_audio_sha256"] = ref["audio"], ref["audio_sha256"]
+            row["ref_is_target"] = row["audio_sha256"] == row["ref_audio_sha256"]
+            if row["ref_is_target"] and not (allow_self and name == "train"):
+                raise ValueError("target-as-reference is forbidden outside explicit training diagnostics")
+    return splits
 
 
-def write_jsonl(path, rows):
-    path.write_text(''.join(json.dumps(r, ensure_ascii=False)+'\n' for r in rows), encoding='utf-8')
+def prepare(source, *, seed, train_frac, dev_frac, allow_self=False):
+    source = Path(source).resolve()
+    if source.suffix.lower() == ".jsonl":
+        rows = io.read_jsonl(source)
+    else:
+        with source.open(encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+    if not rows:
+        raise ValueError("empty input manifest")
+    clean, ids = [], set()
+    for i, r in enumerate(rows):
+        row = dict(r)
+        for key in ("text", "speaker"):
+            row[key] = io.require_text(row.get(key), key)
+        rid = io.safe_id(row.get("row_id") or f"{i:07d}")
+        if rid in ids:
+            raise ValueError(f"duplicate row_id: {rid}")
+        ids.add(rid)
+        path = io.resolve_audio(row.get("audio"), source.parent)
+        row.update(row_id=rid, audio=str(path), audio_sha256=io.sha256(path), **io.audio_info(path))
+        if not 0.25 <= row["duration_s"] <= 15:
+            raise ValueError(f"{rid}: segment audio/transcript together into 0.25-15 second clips; never truncate")
+        row["lang"] = str(row.get("lang") or "es").lower()
+        if row["lang"] != "es":
+            raise ValueError("this validated pilot supports lang=es only")
+        if row.get("ref_audio"):
+            ref = io.resolve_audio(row["ref_audio"], source.parent)
+            row.update(ref_audio=str(ref), ref_audio_sha256=io.sha256(ref))
+        clean.append(row)
+    return split_rows(clean, seed, train_frac, dev_frac, allow_self)
 
 
 def main():
-    ap=argparse.ArgumentParser()
-    ap.add_argument('--input', required=True)
-    ap.add_argument('--output-dir', required=True)
-    ap.add_argument('--seed', type=int, default=20260912)
-    ap.add_argument('--train-frac', type=float, default=.8)
-    ap.add_argument('--dev-frac', type=float, default=.1)
-    a=ap.parse_args()
-    src=Path(a.input); out=Path(a.output_dir); out.mkdir(parents=True, exist_ok=True)
-    rows=load_rows(src)
-    if not rows: raise SystemExit('empty manifest')
-    required={'audio','text','speaker'}
-    cleaned=[]; by_spk=defaultdict(list)
-    for i,r in enumerate(rows):
-        miss=[k for k in required if not str(r.get(k,'')).strip()]
-        if miss: raise ValueError(f'row {i}: missing {miss}')
-        p=Path(r['audio']).expanduser().resolve()
-        if not p.is_file(): raise FileNotFoundError(p)
-        info=torchaudio.info(str(p)); dur=info.num_frames/info.sample_rate
-        if dur<=0: raise ValueError(f'row {i}: zero duration')
-        x=dict(r); x['audio']=str(p); x['lang']=str(x.get('lang') or 'es').lower()
-        x['duration_s']=round(dur,6); x['audio_sha256']=sha256(p); x['row_id']=x.get('row_id') or f'{i:07d}'
-        cleaned.append(x); by_spk[x['speaker']].append(x)
-    for spk,items in by_spk.items():
-        for j,x in enumerate(items):
-            if not x.get('ref_audio'):
-                ref=items[(j+1)%len(items)]['audio'] if len(items)>1 else x['audio']
-                x['ref_audio']=ref
-                x['ref_is_target']=(ref==x['audio'])
-            else:
-                rp=Path(x['ref_audio']).expanduser().resolve()
-                if not rp.is_file(): raise FileNotFoundError(rp)
-                x['ref_audio']=str(rp); x['ref_is_target']=(rp==Path(x['audio']))
-    groups=defaultdict(list)
-    for x in cleaned:
-        session=str(x.get('session') or '').strip()
-        key=f"{x['speaker']}::{session}" if session else f"{x['speaker']}::__speaker__"
-        groups[key].append(x)
-    keys=list(groups); random.Random(a.seed).shuffle(keys)
-    total=sum(len(groups[k]) for k in keys); train_goal=total*a.train_frac; dev_goal=total*a.dev_frac
-    splits={'train':[],'dev':[],'test':[]}
-    for k in keys:
-        if len(splits['train']) < train_goal: dst='train'
-        elif len(splits['dev']) < dev_goal: dst='dev'
-        else: dst='test'
-        splits[dst].extend(groups[k])
-    for name,rs in splits.items(): write_jsonl(out/f'{name}.jsonl', rs)
-    receipt={
-        'source':str(src.resolve()),'seed':a.seed,'rows':len(cleaned),
-        'hours':round(sum(x['duration_s'] for x in cleaned)/3600,4),
-        'speakers':len(by_spk),'groups':len(groups),
-        'split_counts':{k:len(v) for k,v in splits.items()},
-        'split_hours':{k:round(sum(x['duration_s'] for x in v)/3600,4) for k,v in splits.items()},
-        'gender_counts':dict(Counter(str(x.get('gender','unknown')) for x in cleaned)),
-        'dialect_counts':dict(Counter(str(x.get('dialect','unknown')) for x in cleaned)),
-        'target_as_ref_count':sum(bool(x['ref_is_target']) for x in cleaned),
-    }
-    (out/'dataset_receipt.json').write_text(json.dumps(receipt,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
-    print(json.dumps(receipt,indent=2,ensure_ascii=False))
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--output-dir", required=True)
+    ap.add_argument("--seed", type=int, default=20260912)
+    ap.add_argument("--train-frac", type=float, default=.8)
+    ap.add_argument("--dev-frac", type=float, default=.1)
+    ap.add_argument("--allow-self-reference", action="store_true", help="training-only diagnostic; not release qualification")
+    a = ap.parse_args()
+    splits = prepare(a.input, seed=a.seed, train_frac=a.train_frac, dev_frac=a.dev_frac,
+                     allow_self=a.allow_self_reference)
+    with io.output_lock(a.output_dir, empty=True) as out:
+        receipts = {}
+        for name, rows in splits.items():
+            path = out / f"{name}.jsonl"
+            data = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows).encode()
+            io.atomic_write(path, lambda stream, data=data: stream.write(data))
+            by_gender, by_dialect = defaultdict(float), defaultdict(float)
+            for row in rows:
+                by_gender[row.get("gender") or "unknown"] += row["duration_s"]
+                by_dialect[row.get("dialect") or "unknown"] += row["duration_s"]
+            receipts[name] = {"rows": len(rows), "sha256": io.sha256(path),
+                              "seconds_by_gender": dict(by_gender), "seconds_by_dialect": dict(by_dialect)}
+        io.write_json(out / "dataset_receipt.json", {"source_sha256": io.sha256(a.input),
+            "seed": a.seed, "train_frac": a.train_frac, "dev_frac": a.dev_frac, "splits": receipts})
 
-if __name__=='__main__': main()
+
+if __name__ == "__main__":
+    main()
