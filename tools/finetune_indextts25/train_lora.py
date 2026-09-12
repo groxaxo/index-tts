@@ -67,11 +67,21 @@ def one_loss(model,obj,device,bf16):
     text=obj['text_tokens'].to(device).long().unsqueeze(0); codes=obj['mel_codes'].to(device).long().unsqueeze(0)
     camp=obj['campplus'].to(device).unsqueeze(0); emo=obj['emo_condition'].to(device).unsqueeze(0)
     lang=torch.tensor([int(obj['lang_id'])],device=device,dtype=torch.long)
-    tl=torch.tensor([text.shape[1]],device=device); ml=torch.tensor([codes.shape[1]],device=device)
     el=torch.tensor([emo.shape[1]],device=device)
     with torch.amp.autocast('cuda',enabled=bf16 and str(device).startswith('cuda'),dtype=torch.bfloat16):
-        hidden=model(camp,text,tl,codes,ml,emo,emo_cond_mel_lengths=el,do_spk_cond=True,langs=lang)
-        logits=model.mel_head(hidden).float()
+        spk=model.spk_emb_proj(camp)
+        if spk.ndim!=3: spk=spk.unsqueeze(1)
+        emo_vec=model.get_emo_conditioning(emo.transpose(1,2),el)
+        emo_vec=model.emo_layer(model.emovec_layer(emo_vec))
+        conds=torch.cat((spk+emo_vec.unsqueeze(1),torch.zeros(spk.size(0),2,spk.size(2),device=spk.device,dtype=spk.dtype)),1)
+        text_in=F.pad(text,(1,1),value=model.start_text_token)
+        text_in[:,-1]=model.stop_text_token
+        text_pos=model.text_pos_embedding(text_in)
+        text_emb=model.text_embedding(text_in)+text_pos+model.lang_embedding(lang).unsqueeze(1)
+        mel_in=F.pad(codes,(1,0),value=model.start_mel_token)
+        mel_emb=model.mel_embedding(mel_in)+model.mel_pos_embedding(mel_in)
+        _,mel_hidden=model.get_logits(conds,text_emb,model.text_head,mel_emb,model.mel_head,return_latent=True)
+        logits=model.mel_head(mel_hidden[:,:codes.shape[1]]).float()
         loss=F.cross_entropy(logits.reshape(-1,logits.shape[-1]),codes.reshape(-1))
     return loss
 
