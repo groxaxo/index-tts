@@ -2,7 +2,6 @@
 import argparse, json, re
 from pathlib import Path
 import torch, torchaudio
-import torch.nn.functional as F
 from indextts.infer_v2_5 import IndexTTS2, apply_pronunciation_annotations
 from indextts.utils.nemo_tn import normalize_text as nemo_text_normalize
 from indextts.utils.tokenizer import lang_to_token
@@ -52,7 +51,9 @@ def main():
         if dest.exists() and not a.overwrite:
             receipt.append({'row_id':rid,'file':str(dest),'status':'existing'}); continue
         lang=str(r.get('lang') or 'es').lower(); txt=clean_text(tts,str(r['text']),lang)
-        toks=tts.tokenizer.encode(f'<|{lang}|> '+txt,allowed_special='all')
+        # In IndexTTS 2.5 CAMPPlus mode language is injected through lang_embedding.
+        # Do not prepend <|lang|> here or training would encode language twice.
+        toks=tts.tokenizer.encode(txt,allowed_special='all')
         toks=torch.tensor(toks,dtype=torch.long)
         if len(toks)+2 > tts.gpt.text_pos_embedding.emb.num_embeddings:
             raise ValueError(f'{rid}: {len(toks)} text tokens exceed model capacity')
