@@ -19,6 +19,10 @@ The workflow intentionally starts with a small single-GPU LoRA experiment. It is
 
 The scripts are deliberately explicit about artifact provenance and never promote the last training step automatically.
 
+## Important cache/version note
+
+Feature caches created before the language-conditioning fix in this PR must be regenerated. In IndexTTS 2.5 CAMPPlus mode, the language ID is applied through `lang_embedding`; cached text tokens therefore must **not** include an additional `<|es|>` prefix. `precompute_features.py` and `train_lora.py` now mirror that inference-time behavior.
+
 ## Input manifest
 
 CSV or JSONL rows must contain:
