@@ -38,6 +38,8 @@ def inject(model,pattern,rank,alpha,dropout,targets=None):
         parametrize.register_parametrization(module,'weight',LoRAWeight(tuple(w.shape),rank,alpha,dropout))
         chosen.append(name)
     if not chosen: raise RuntimeError(f'no 2-D weights matched {pattern}')
+    if targets is not None and set(chosen)!=set(targets):
+        missing=sorted(set(targets)-set(chosen)); raise RuntimeError(f'adapter targets missing from model: {missing[:5]}')
     return chosen
 
 
@@ -47,12 +49,14 @@ def adapter_state(model,targets,meta):
 
 
 def load_adapter(model,path,dropout_override=None):
-    a=torch.load(path,map_location='cpu'); meta=a
+    a=torch.load(path,map_location='cpu')
+    if a.get('format')!='indextts25-native-lora-v1': raise RuntimeError(f"unsupported adapter format: {a.get('format')}")
     inject(model,'$',int(a['rank']),float(a['alpha']),float(a.get('dropout',0) if dropout_override is None else dropout_override),targets=a['targets'])
-    missing,unexpected=model.load_state_dict(a['state_dict'],strict=False)
-    bad=[x for x in unexpected if 'parametrizations.weight.0.' in x]
-    if bad: raise RuntimeError(f'adapter load failed: {bad}')
-    return meta
+    incompatible=model.load_state_dict(a['state_dict'],strict=False)
+    unexpected=[x for x in incompatible.unexpected_keys if 'parametrizations.weight.0.' in x]
+    missing=[x for x in incompatible.missing_keys if '.parametrizations.weight.0.' in x]
+    if unexpected or missing: raise RuntimeError(f'adapter load failed: missing={missing[:5]} unexpected={unexpected[:5]}')
+    return a
 
 
 def files(root,max_items=0):
@@ -62,19 +66,20 @@ def files(root,max_items=0):
 def one_loss(model,obj,device,bf16):
     text=obj['text_tokens'].to(device).long().unsqueeze(0); codes=obj['mel_codes'].to(device).long().unsqueeze(0)
     camp=obj['campplus'].to(device).unsqueeze(0); emo=obj['emo_condition'].to(device).unsqueeze(0)
+    lang=torch.tensor([int(obj['lang_id'])],device=device,dtype=torch.long)
     tl=torch.tensor([text.shape[1]],device=device); ml=torch.tensor([codes.shape[1]],device=device)
     el=torch.tensor([emo.shape[1]],device=device)
     with torch.amp.autocast('cuda',enabled=bf16 and str(device).startswith('cuda'),dtype=torch.bfloat16):
-        hidden=model(camp,text,tl,codes,ml,emo,emo_cond_mel_lengths=el,do_spk_cond=True)
+        hidden=model(camp,text,tl,codes,ml,emo,emo_cond_mel_lengths=el,do_spk_cond=True,langs=lang)
         logits=model.mel_head(hidden).float()
         loss=F.cross_entropy(logits.reshape(-1,logits.shape[-1]),codes.reshape(-1))
     return loss
 
 @torch.no_grad()
 def evaluate(model,paths,device,bf16,limit=32):
-    model.eval(); vals=[]
+    was_training=model.training; model.eval(); vals=[]
     for p in paths[:limit]: vals.append(float(one_loss(model,torch.load(p,map_location='cpu'),device,bf16)))
-    model.train(); return sum(vals)/len(vals) if vals else None
+    model.train(was_training); return sum(vals)/len(vals) if vals else None
 
 
 def main():
@@ -113,7 +118,7 @@ def main():
         if step==start+1:
             g=sum(float(p.grad.float().norm()) for p in trainable if p.grad is not None)
             if not math.isfinite(g) or g==0: raise RuntimeError(f'invalid LoRA gradient norm: {g}')
-        grad=float(torch.nn.utils.clip_grad_norm_(trainable,a.clip_grad));
+        grad=float(torch.nn.utils.clip_grad_norm_(trainable,a.clip_grad))
         scale=min(1.0,step/max(1,a.warmup_steps)); lr=a.learning_rate*scale
         for pg in opt.param_groups: pg['lr']=lr
         opt.step(); opt.zero_grad(set_to_none=True)
@@ -122,13 +127,13 @@ def main():
         if dev and (step==1 or step%a.eval_every==0): rec['dev_loss']=evaluate(model,dev,a.device,a.bf16)
         log.append(rec); print(json.dumps(rec))
         if step%a.save_every==0 or step==a.max_steps:
-            meta={'step':step,'rank':a.rank,'alpha':a.alpha,'dropout':a.dropout,'target_regex':a.target_regex,'base_gpt_checkpoint':str(cfg.gpt_checkpoint),'seed':a.seed}
-            path=out/f'adapter-step-{step:06d}.pt'; torch.save(adapter_state(model,targets,meta),path)
-            # Fresh reload gate: instantiate base, inject adapter, and ensure state loads.
+            rank=int(meta['rank']) if a.resume else a.rank; alpha=float(meta['alpha']) if a.resume else a.alpha; dropout=float(meta.get('dropout',0)) if a.resume else a.dropout
+            save_meta={'step':step,'rank':rank,'alpha':alpha,'dropout':dropout,'target_regex':a.target_regex,'base_gpt_checkpoint':str(cfg.gpt_checkpoint),'seed':a.seed}
+            path=out/f'adapter-step-{step:06d}.pt'; torch.save(adapter_state(model,targets,save_meta),path)
             fresh,_=load_gpt(a.config,a.model_dir,a.device,a.bf16); [p.requires_grad_(False) for p in fresh.parameters()]
             load_adapter(fresh,path); del fresh
             (out/'train_log.json').write_text(json.dumps(log,indent=2)+'\n')
-    receipt={'base_gpt_checkpoint':str(cfg.gpt_checkpoint),'targets':targets,'trainable_parameters':sum(p.numel() for p in trainable),'seed':a.seed,'max_steps':a.max_steps,'grad_accum':a.grad_accum,'learning_rate':a.learning_rate,'rank':a.rank,'alpha':a.alpha,'dropout':a.dropout}
+    receipt={'base_gpt_checkpoint':str(cfg.gpt_checkpoint),'targets':targets,'trainable_parameters':sum(p.numel() for p in trainable),'seed':a.seed,'max_steps':a.max_steps,'grad_accum':a.grad_accum,'learning_rate':a.learning_rate,'rank':int(meta['rank']) if a.resume else a.rank,'alpha':float(meta['alpha']) if a.resume else a.alpha,'dropout':float(meta.get('dropout',0)) if a.resume else a.dropout}
     (out/'run_receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
 
 if __name__=='__main__': main()
